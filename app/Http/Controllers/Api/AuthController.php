@@ -11,8 +11,16 @@ use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Validator;
 use Laravel\Socialite\Facades\Socialite;
 use Laravel\Socialite\Two\AbstractProvider;
+use Illuminate\Support\Facades\RateLimiter;
+use Illuminate\Validation\Rule;
 use Illuminate\Support\Str;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Mail;
+use Illuminate\Support\Facades\Http;
+use Overtrue\EasySms\EasySms;
+use Overtrue\EasySms\PhoneNumber;
+use Overtrue\EasySms\Exceptions\NoGatewayAvailableException;
 use Carbon\Carbon;
 
 
@@ -23,38 +31,119 @@ class AuthController extends Controller
      */
     public function sendVerificationCode(Request $request)
     {
-        $request->validate([
+        // 1. 验证输入
+        $validator = Validator::make($request->all(), [
             'account' => 'required|string',
             'type'    => 'required|in:register,login,reset',
-            'country_code' => 'nullable|string' 
+            // 如果是邮箱，country_code 可选；如果是手机，则为必填
+            'country_code' => ['nullable', 'string', Rule::requiredIf(function () use ($request) {
+                return !filter_var($request->account, FILTER_VALIDATE_EMAIL);
+            })],
         ]);
-    
+
+        if ($validator->fails()) {
+            return response()->json(['code' => 422, 'msg' => $validator->errors()->first()], 422);
+        }
+
         $account = $request->account;
-        // 自动识别是否为邮箱
         $isEmail = filter_var($account, FILTER_VALIDATE_EMAIL);
-    
-        // 1. 频率限制 (60秒)
-        $exists = VerificationCode::where('account', $account)
-            ->where('created_at', '>', now()->subMinute())
-            ->exists();
-        if ($exists) return response()->json(['code' => 429, 'msg' => '发送太频繁']);
-    
-        // 2. 生成并保存
+        
+        // 使用账户做频率限制键名
+        $key = 'send_code_' . $account;
+
+        // 2. 频率限制 (60秒内只能发送一次)
+        if (RateLimiter::tooManyAttempts($key, 1)) {
+            $seconds = RateLimiter::availableIn($key);
+            return response()->json([
+                'code' => 429, 
+                'msg' => "发送太频繁，请 {$seconds} 秒后再试"
+            ], 429);
+        }
+
+        // 3. 生成 6 位随机验证码
         $code = str_pad(random_int(0, 999999), 6, '0', STR_PAD_LEFT);
-        VerificationCode::create([
-            'account'      => $account,
-            'country_code' => $isEmail ? null : $request->country_code,
-            'code'         => $code,
-            'type'         => $request->type,
-            'expired_at'   => now()->addMinutes(10),
-        ]);
-    
-        // 3. 返回 (开发阶段直接返回 code)
-        return response()->json([
-            'code' => 200, 
-            'msg' => '验证码已发送至' . ($isEmail ? '邮箱' : '手机'),
-            'data' => ['code' => $code] 
-        ]);
+
+        // 4. 保存到数据库
+        try {
+            VerificationCode::create([
+                'account'      => $account,
+                'country_code' => $isEmail ? null : $request->country_code,
+                'code'         => $code,
+                'type'         => $request->type,
+                'expired_at'   => now()->addMinutes(10), // 10分钟有效期
+            ]);
+        } catch (\Exception $e) {
+            Log::error('保存验证码失败: ' . $e->getMessage());
+            return response()->json(['code' => 500, 'msg' => '内部服务器错误']);
+        }
+
+        // 5. 发送逻辑
+        try {
+            if ($isEmail) {
+                // 发送邮件
+                Mail::raw("您的验证码是：{$code}，10分钟内有效。", function ($message) use ($account) {
+                    $message->to($account)->subject('账户安全验证');
+                });
+                
+                if (count(Mail::failures()) > 0) {
+                    throw new \Exception('邮件服务不可用');
+                }
+            } else {
+                // --- 直接使用 EasySms 发送短信 ---
+                $config = config('sms'); // 加载 config/sms.php
+                $easySms = new EasySms($config);
+
+                // 使用 PhoneNumber 类处理号码
+                $phoneNumber = new PhoneNumber($account, $request->country_code ?? '86');
+                
+                // 从 .env 读取模板 ID (建议)
+                $templateId = env('ALIYUN_SMS_TEMPLATE_CODE');
+                
+                if (empty($templateId)) {
+                    throw new \Exception('短信模板 ID 未配置 (ALIYUN_SMS_TEMPLATE_CODE)');
+                }
+                
+                $easySms->send($phoneNumber, [
+                    'template' => $templateId, // 你的模板ID
+                    'data'     => [
+                        'code' => $code // 你的模板变量名
+                    ],
+                ]);
+                
+                Log::info("EasySms 发送成功: {$account}, 模板: {$templateId}");
+            }
+        } catch (NoGatewayAvailableException $exception) {
+            // 获取网关错误信息
+            $message = $exception->getException('aliyun')->getMessage();
+            Log::error('短信发送失败: ' . $message);
+            
+            // 发送失败需要释放频率限制
+            RateLimiter::clear($key);
+            
+            return response()->json(['code' => 500, 'msg' => '验证码发送失败，请稍后再试']);
+        } catch (\Exception $e) {
+            Log::error('发送异常: ' . $e->getMessage());
+            RateLimiter::clear($key);
+            return response()->json(['code' => 500, 'msg' => '服务故障，请稍后再试']);
+        }
+
+        // 频率限制通过后，标记一次
+        RateLimiter::hit($key, 60);
+
+        // 6. 返回结果
+        $response = [
+            'code' => 200,
+            'msg' => '验证码发送成功',
+        ];
+
+        // 开发环境为了调试方便，可以在 data 中返回 code
+        if (app()->environment('local')) {
+            $response['data'] = ['code' => $code];
+        } else {
+            $response['data'] = [];
+        }
+
+        return response()->json($response);
     }
 
     /**
@@ -62,47 +151,72 @@ class AuthController extends Controller
      */
     public function register(Request $request)
     {
-        $request->validate([
+        // 1. 数据验证
+        $validator = Validator::make($request->all(), [
             'nickname'          => 'required|string|max:50',
             'account'           => 'required|string', // 填手机或邮箱
             'password'          => 'required|string|min:6',
             'verification_code' => 'required|string',
-            'country_code'      => 'nullable|string', // 手机注册必填
+            // 如果是手机，country_code 为必填
+            'country_code'      => ['nullable', 'string', Rule::requiredIf(function () use ($request) {
+                return !filter_var($request->account, FILTER_VALIDATE_EMAIL);
+            })],
         ]);
+
+        if ($validator->fails()) {
+            return response()->json(['code' => 422, 'msg' => $validator->errors()->first()], 422);
+        }
     
         $account = $request->account;
         $isEmail = filter_var($account, FILTER_VALIDATE_EMAIL);
     
-        // 1. 校验验证码
+        // 2. 校验验证码
         $vCode = VerificationCode::where('account', $account)
             ->where('code', $request->verification_code)
             ->where('type', 'register')
-            ->where('status', 0)
-            ->where('expired_at', '>', now())
+            ->where('status', 0) // 未使用
+            ->where('expired_at', '>', now()) // 未过期
             ->latest()
             ->first();
     
-        if (!$vCode) return response()->json(['code' => 400, 'msg' => '验证码错误']);
+        if (!$vCode) {
+            return response()->json(['code' => 400, 'msg' => '验证码错误或已过期']);
+        }
     
-        // 2. 检查用户是否已存在
-        $exists = $isEmail 
-            ? User::where('email', $account)->exists()
-            : User::where('phone', $account)->where('country_code', $request->country_code)->exists();
+        // 3. 检查用户是否已存在
+        $existsQuery = $isEmail 
+            ? User::where('email', $account)
+            : User::where('phone', $account);
+
+        // 如果是手机，必须检查国家代码
+        if (!$isEmail) {
+            $existsQuery->where('country_code', $request->country_code);
+        }
     
-        if ($exists) return response()->json(['code' => 400, 'msg' => '该账号已被注册']);
+        if ($existsQuery->exists()) {
+            return response()->json(['code' => 400, 'msg' => '该账号已被注册']);
+        }
     
-        // 3. 创建用户
-        $user = User::create([
-            'nickname'     => $request->nickname,
-            'email'        => $isEmail ? $account : null,
-            'phone'        => $isEmail ? null : $account,
-            'country_code' => $isEmail ? null : $request->country_code,
-            'password'     => Hash::make($request->password),
-            'ip_address'   => $request->ip(),
-        ]);
+        // 4. 创建用户
+        try {
+            $user = User::create([
+                'nickname'     => $request->nickname,
+                'email'        => $isEmail ? $account : null,
+                'phone'        => $isEmail ? null : $account,
+                'country_code' => $isEmail ? null : $request->country_code,
+                'password'     => Hash::make($request->password),
+                'ip_address'   => $request->ip(),
+            ]);
     
-        $vCode->update(['status' => 1]);
+            // 5. 标记验证码为已使用
+            $vCode->update(['status' => 1]);
+
+        } catch (\Exception $e) {
+            Log::error('用户注册失败: ' . $e->getMessage());
+            return response()->json(['code' => 500, 'msg' => '注册失败，请稍后再试']);
+        }
     
+        // 6. 返回结果（包含Token）
         return response()->json([
             'code' => 200,
             'msg'  => '注册成功',
@@ -116,35 +230,56 @@ class AuthController extends Controller
     /**
      * 登录接口 (支持密码登录或验证码快捷登录)
      */
+/**
+     * 用户登录
+     */
     public function login(Request $request)
     {
-        $request->validate([
+        // 1. 数据验证
+        $validator = Validator::make($request->all(), [
             'account'           => 'required|string',
-            'country_code'      => 'nullable|string',
+            // 如果是手机，country_code 为必填
+            'country_code'      => ['nullable', 'string', Rule::requiredIf(function () use ($request) {
+                return !filter_var($request->account, FILTER_VALIDATE_EMAIL);
+            })],
+            // 密码和验证码至少填写一个
             'password'          => 'required_without:verification_code',
             'verification_code' => 'required_without:password',
         ]);
+
+        if ($validator->fails()) {
+            return response()->json(['code' => 422, 'msg' => $validator->errors()->first()], 422);
+        }
     
         $account = $request->account;
         $isEmail = filter_var($account, FILTER_VALIDATE_EMAIL);
     
-        // 1. 查找用户
+        // 2. 查找用户
         $user = $isEmail 
             ? User::where('email', $account)->first()
             : User::where('phone', $account)->where('country_code', $request->country_code)->first();
     
-        if (!$user) return response()->json(['code' => 404, 'msg' => '账号不存在']);
+        if (!$user) {
+            return response()->json(['code' => 404, 'msg' => '账号不存在']);
+        }
     
-        // 2. 校验凭证
+        // 3. 校验凭证
         if ($request->filled('verification_code')) {
             // 验证码模式
-            $vCheck = VerificationCode::where('account', $account)
+            $vCode = VerificationCode::where('account', $account)
                 ->where('code', $request->verification_code)
                 ->where('type', 'login')
-                ->where('status', 0)
-                ->where('expired_at', '>', now())
-                ->exists();
-            if (!$vCheck) return response()->json(['code' => 400, 'msg' => '验证码错误']);
+                ->where('status', 0) // 未使用
+                ->where('expired_at', '>', now()) // 未过期
+                ->latest()
+                ->first();
+
+            if (!$vCode) {
+                return response()->json(['code' => 400, 'msg' => '验证码错误或已过期']);
+            }
+            
+            $vCode->update(['status' => 1]);
+            
         } else {
             // 密码模式
             if (!Hash::check($request->password, $user->password)) {
@@ -152,6 +287,7 @@ class AuthController extends Controller
             }
         }
     
+        // 4. 返回结果
         return response()->json([
             'code' => 200,
             'msg'  => '登录成功',
@@ -167,56 +303,74 @@ class AuthController extends Controller
      */
     public function forgotPassword(Request $request)
     {
-        $v = Validator::make($request->all(), [
-            'account'           => 'required|string', // 手机号或邮箱
-            'country_code'      => 'nullable|string', // 手机号重置时必填
+        // 1. 验证输入
+        $validator = Validator::make($request->all(), [
+            'account'           => 'required|string',
+            // 如果是手机，country_code 为必填
+            'country_code'      => ['nullable', 'string', Rule::requiredIf(function () use ($request) {
+                return !filter_var($request->account, FILTER_VALIDATE_EMAIL);
+            })],
             'verification_code' => 'required|string',
             'new_password'      => 'required|string|min:6|confirmed', // 需配合 new_password_confirmation
         ]);
 
-        if ($v->fails()) {
-            return response()->json(['code' => 422, 'msg' => '校验失败', 'errors' => $v->errors()], 422);
+        if ($validator->fails()) {
+            return response()->json(['code' => 422, 'msg' => $validator->errors()->first()], 422);
         }
 
         $account = $request->account;
         $isEmail = filter_var($account, FILTER_VALIDATE_EMAIL);
 
-        // 1. 校验验证码逻辑 (适配 account 字段)
-        $vCode = VerificationCode::where('account', $account)
-            ->when(!$isEmail, function($q) use ($request) {
-                return $q->where('country_code', $request->country_code);
-            })
+        // 2. 校验验证码
+        $vCodeQuery = VerificationCode::where('account', $account)
             ->where('code', $request->verification_code)
             ->where('type', 'reset') 
-            ->where('status', 0)
-            ->where('expired_at', '>', now())
-            ->latest()
-            ->first();
+            ->where('status', 0) // 未使用
+            ->where('expired_at', '>', now()); // 未过期
 
-        if (!$vCode) {
-            return response()->json(['code' => 400, 'msg' => '验证码无效或已过期'], 400);
+        // 如果是手机，必须带上区号查询
+        if (!$isEmail) {
+            $vCodeQuery->where('country_code', $request->country_code);
         }
 
-        // 2. 查找用户 (适配手机/邮箱双渠道)
-        $user = $isEmail 
-            ? User::where('email', $account)->first()
-            : User::where('phone', $account)->where('country_code', $request->country_code)->first();
+        $vCode = $vCodeQuery->latest()->first();
+
+        if (!$vCode) {
+            return response()->json(['code' => 400, 'msg' => '验证码错误或已过期'], 400);
+        }
+
+        // 3. 查找用户
+        $userQuery = $isEmail 
+            ? User::where('email', $account)
+            : User::where('phone', $account)->where('country_code', $request->country_code);
+
+        $user = $userQuery->first();
 
         if (!$user) {
             return response()->json(['code' => 404, 'msg' => '该账号不存在'], 404);
         }
 
-        // 3. 更新密码并消耗验证码
-        $user->update(['password' => Hash::make($request->new_password)]);
-        $vCode->update(['status' => 1]);
+        // 4. 更新密码并消耗验证码
+        try {
+            DB::beginTransaction();
 
-        // 4. 让旧的 Token 全部失效，确保安全性
-        $user->tokens()->delete();
+            $user->update(['password' => Hash::make($request->new_password)]);
+            $vCode->update(['status' => 1]); // 标记验证码已使用
+
+            // 5. 让旧的 Token 全部失效，确保安全性 (非常好的实践)
+            $user->tokens()->delete();
+
+            DB::commit();
+        } catch (\Exception $e) {
+            DB::rollBack();
+            Log::error('重置密码失败: ' . $e->getMessage());
+            return response()->json(['code' => 500, 'msg' => '系统繁忙，请稍后再试'], 500);
+        }
 
         return response()->json(['code' => 200, 'msg' => '密码重置成功，请重新登录']);
     }
 
-/**
+    /**
      * 重定向至第三方平台
      * GET /api/auth/social/{provider}/redirect
      */
@@ -246,24 +400,18 @@ class AuthController extends Controller
         $avatar = null;
 
         // 2. Mock 逻辑或正式逻辑获取用户信息
-        if (app()->environment('local') && request()->has('test')) {
-            $socialId = '123456789';
-            $email = 'test_oauth@example.com';
-            $nickname = 'OAuth测试员';
-            $avatar = 'https://via.placeholder.com/150';
-        } else {
-            try {
-                /** @var \Laravel\Socialite\Two\AbstractProvider $driver */
-                $driver = Socialite::driver($provider);
-                $socialUser = $driver->stateless()->user();
-                
-                $socialId = $socialUser->getId();
-                $email    = $socialUser->getEmail();
-                $nickname = $socialUser->getName() ?? $socialUser->getNickname();
-                $avatar   = $socialUser->getAvatar();
-            } catch (\Exception $e) {
-                return response()->json(['code' => 401, 'msg' => '第三方授权失败: ' . $e->getMessage()]);
-            }
+
+        try {
+            /** @var \Laravel\Socialite\Two\AbstractProvider $driver */
+            $driver = Socialite::driver($provider);
+            $socialUser = $driver->stateless()->user();
+            
+            $socialId = $socialUser->getId();
+            $email    = $socialUser->getEmail();
+            $nickname = $socialUser->getName() ?? $socialUser->getNickname();
+            $avatar   = $socialUser->getAvatar();
+        } catch (\Exception $e) {
+            return response()->json(['code' => 401, 'msg' => '第三方授权失败: ' . $e->getMessage()]);
         }
 
         // 3. 执行数据库绑定逻辑 (使用 DB 事务保证原子性)
@@ -278,14 +426,13 @@ class AuthController extends Controller
             } else {
                 // 处理邮箱逻辑：如果第三方没给邮箱，生成固定格式占位符
                 $targetEmail = $email ?: ($provider . '_' . $socialId . '@no-email.com');
-                
-                // 查找或创建用户
+    
                 $user = User::where('email', $targetEmail)->first();
-
+            
                 if (!$user) {
                     $user = User::create([
                         'nickname'   => $nickname,
-                        'email'      => $targetEmail,
+                        'email'      => $targetEmail, 
                         'password'   => Hash::make(Str::random(24)),
                         'ip_address' => request()->ip(),
                     ]);

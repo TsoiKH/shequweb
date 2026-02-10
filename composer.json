@@ -16,6 +16,7 @@
         "laravel/sanctum": "^2.15",
         "laravel/socialite": "^5.16",
         "laravel/tinker": "^2.0",
+        "overtrue/easy-sms": "^2.7",
         "stevebauman/location": "^6.6"
     },
     "require-dev": {

@@ -598,6 +598,15 @@
             'aliases' => array(),
             'dev_requirement' => false,
         ),
+        'overtrue/easy-sms' => array(
+            'pretty_version' => '2.7.1',
+            'version' => '2.7.1.0',
+            'reference' => 'd71d32f6631dda4c0da09c2831ff110a1c19873c',
+            'type' => 'library',
+            'install_path' => __DIR__ . '/../overtrue/easy-sms',
+            'aliases' => array(),
+            'dev_requirement' => false,
+        ),
         'paragonie/constant_time_encoding' => array(
             'pretty_version' => 'v2.8.2',
             'version' => '2.8.2.0',
