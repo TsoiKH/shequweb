@@ -93,4 +93,14 @@ class Post extends Model
             }
         ]);
     }
+
+    public function reports()
+    {
+        return $this->hasMany(Report::class);
+    }
+
+    public function pendingReports()
+    {
+        return $this->hasMany(Report::class)->where('status', 0);
+    }
 }

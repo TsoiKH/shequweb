@@ -572,6 +572,7 @@ class ComposerStaticInit17987bd5a714b10cf183a6ef07f9397b
         'App\\Http\\Resources\\MessageResource' => __DIR__ . '/../..' . '/app/Http/Resources/MessageResource.php',
         'App\\Http\\Resources\\NotificationResource' => __DIR__ . '/../..' . '/app/Http/Resources/NotificationResource.php',
         'App\\Http\\Resources\\PostResource' => __DIR__ . '/../..' . '/app/Http/Resources/PostResource.php',
+        'App\\Models\\AdminUser' => __DIR__ . '/../..' . '/app/Models/AdminUser.php',
         'App\\Models\\Collection' => __DIR__ . '/../..' . '/app/Models/Collection.php',
         'App\\Models\\Comment' => __DIR__ . '/../..' . '/app/Models/Comment.php',
         'App\\Models\\Follow' => __DIR__ . '/../..' . '/app/Models/Follow.php',

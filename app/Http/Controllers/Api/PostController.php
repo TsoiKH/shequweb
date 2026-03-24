@@ -54,8 +54,13 @@ class PostController extends Controller
         $position = Location::get($testIp);
 
         // --- 媒体分类 ---
-        $firstFile = $request->media_urls[0];
-        $mediaType = preg_match('/\.(mp4|mov|avi|wmv)$/i', $firstFile) ? 'video' : 'image';
+        $mediaUrls = $request->input('media_urls', []);
+        if (empty($mediaUrls)) {
+            $mediaType = 'text'; 
+        } else {
+            $firstFile = $mediaUrls[0];
+            $mediaType = preg_match('/\.(mp4|mov|avi|wmv)$/i', $firstFile) ? 'video' : 'image';
+        }
 
         // 2. 创建帖子
         $post = Post::create([

@@ -28,6 +28,7 @@ return array(
     'App\\Http\\Resources\\MessageResource' => $baseDir . '/app/Http/Resources/MessageResource.php',
     'App\\Http\\Resources\\NotificationResource' => $baseDir . '/app/Http/Resources/NotificationResource.php',
     'App\\Http\\Resources\\PostResource' => $baseDir . '/app/Http/Resources/PostResource.php',
+    'App\\Models\\AdminUser' => $baseDir . '/app/Models/AdminUser.php',
     'App\\Models\\Collection' => $baseDir . '/app/Models/Collection.php',
     'App\\Models\\Comment' => $baseDir . '/app/Models/Comment.php',
     'App\\Models\\Follow' => $baseDir . '/app/Models/Follow.php',
