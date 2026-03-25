@@ -20,7 +20,6 @@ class User extends Authenticatable
         'avatar',
         'city',
         'bio',
-        'ip_address',
     ];
 
     /**

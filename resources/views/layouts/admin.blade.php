@@ -98,6 +98,7 @@
         <a href="{{ route('admin.posts.index') }}">帖子内容管理</a>
         <a href="{{ route('admin.reports.index') }}">举报管理审核</a>
         <a href="{{ route('admin.tags.index') }}">话题标签</a>
+        <a href="{{ route('admin.sensitive_words.index') }}">敏感词管理</a>
     </div>
 
     <div class="main-content">

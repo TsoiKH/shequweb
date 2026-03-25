@@ -57,5 +57,12 @@ Route::prefix('admin')->name('admin.')->group(function () {
             Route::patch('/{id}/handle', 'handle')->name('handle'); 
         });
 
+        // 敏感词管理
+        Route::prefix('sensitive-words')->name('sensitive_words.')->controller(\App\Http\Controllers\Admin\SensitiveWordController::class)->group(function () {
+            Route::get('/', 'index')->name('index');
+            Route::post('/', 'store')->name('store');
+            Route::delete('/{id}', 'destroy')->name('destroy');
+        });
+
     });
 });

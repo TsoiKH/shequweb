@@ -14,6 +14,14 @@ use Illuminate\Support\Facades\DB;
 class UserController extends Controller
 {
     /**
+     * 获取当前登录用户信息
+     */
+    public function me(Request $request)
+    {
+        return response()->json(['code' => 200, 'data' => $request->user()]);
+    }
+
+    /**
      * 获取用户个人资料
      */
     public function profile($id = null)

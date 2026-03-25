@@ -8,6 +8,7 @@ use App\Http\Controllers\Api\PostController;
 use App\Http\Controllers\Api\NotificationController;
 use App\Http\Controllers\Api\MessageController;
 use App\Http\Controllers\Api\TagController;
+use App\Http\Controllers\Api\CommentController;
 
 /*
 |--------------------------------------------------------------------------
@@ -15,10 +16,10 @@ use App\Http\Controllers\Api\TagController;
 |--------------------------------------------------------------------------
 */
 Route::prefix('auth')->controller(AuthController::class)->group(function () {
-    Route::post('/send-code', 'sendVerificationCode');
-    Route::post('/register', 'register');
-    Route::post('/login', 'login');
-    Route::post('/forgot-password', 'forgotPassword');
+    Route::post('/send-code', 'sendVerificationCode')->middleware('throttle:3,1');
+    Route::post('/register', 'register')->middleware('throttle:10,1');
+    Route::post('/login', 'login')->middleware('throttle:10,1');
+    Route::post('/forgot-password', 'forgotPassword')->middleware('throttle:3,1');
 });
 
 // 第三方登录相关路由
@@ -63,7 +64,6 @@ Route::prefix('posts')->controller(PostController::class)->group(function () {
         Route::post('/{id}/share-ticket', 'shareTicket');
         Route::post('/{id}/like', 'toggleLike');
         Route::post('/{id}/collect', 'toggleCollect');
-        Route::post('/{id}/comment', 'comment');
         Route::post('/{id}/visibility', 'toggleVisibility');
     });
     // --- D. 详情查询 (通配符路由，必须放最后) ---
@@ -80,9 +80,7 @@ Route::middleware('auth:sanctum')->group(function () {
     
     // 用户资料与社交
     Route::prefix('users')->controller(UserController::class)->group(function () {
-        Route::get('/me', function (Request $request) {
-            return response()->json(['code' => 200, 'data' => $request->user()]);
-        });
+        Route::get('/me', 'me');
         Route::get('/profile/{id?}', 'profile'); 
         Route::post('/{id}/follow', 'toggleFollow');
         Route::post('/avatar', 'uploadAvatar'); 
@@ -92,10 +90,11 @@ Route::middleware('auth:sanctum')->group(function () {
     });
 
     // 独立互动操作
-    Route::prefix('comments')->controller(PostController::class)->group(function () {
-        Route::delete('{comment_id}', 'deleteComment');
-        Route::post('{id}/like', 'toggleCommentLike');
-        Route::get('{id}/replies', 'commentReplies');
+    Route::prefix('comments')->controller(CommentController::class)->group(function () {
+        Route::post('/{postId}', 'store');
+        Route::delete('{id}', 'destroy');
+        Route::post('{id}/like', 'toggleLike');
+        Route::get('{id}/replies', 'getReplies');
     });
 
     // 通知系统

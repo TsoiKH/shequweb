@@ -7,17 +7,14 @@ use Illuminate\Database\Eloquent\Model;
 class Post extends Model
 {
     protected $fillable = [
-        'user_id', 
+        'user_id',
         'title', 
         'content', 
         'media_type', 
         'media_urls', 
         'country', 
         'city', 
-        'status',
-        'ip_address',
         'address', 
-        'collect_count',
     ];
 
     /**

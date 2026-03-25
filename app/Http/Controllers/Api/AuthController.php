@@ -52,7 +52,8 @@ class AuthController extends Controller
         $key = 'send_code_' . $account;
 
         // 2. 频率限制 (60秒内只能发送一次)
-        if (RateLimiter::tooManyAttempts($key, 1)) {
+        // 本地环境不限制，方便调试
+        if (!app()->isLocal() && RateLimiter::tooManyAttempts($key, 1)) {
             $seconds = RateLimiter::availableIn($key);
             return response()->json([
                 'code' => 429, 
@@ -77,7 +78,16 @@ class AuthController extends Controller
             return response()->json(['code' => 500, 'msg' => '内部服务器错误']);
         }
 
-        // 5. 发送逻辑
+        // 5. 发送逻辑 (本地环境跳过真实发送，直接返回成功)
+        if (app()->isLocal()) {
+            Log::info("本地环境跳过真实发送: {$account}, 验证码: {$code}");
+            return response()->json([
+                'code' => 200,
+                'msg' => '验证码发送成功（本地环境：请查看响应或 Log）',
+                'data' => ['code' => $code]
+            ]);
+        }
+
         try {
             if ($isEmail) {
                 // 发送邮件
@@ -170,17 +180,22 @@ class AuthController extends Controller
         $account = $request->account;
         $isEmail = filter_var($account, FILTER_VALIDATE_EMAIL);
     
-        // 2. 校验验证码
-        $vCode = VerificationCode::where('account', $account)
-            ->where('code', $request->verification_code)
-            ->where('type', 'register')
-            ->where('status', 0) // 未使用
-            ->where('expired_at', '>', now()) // 未过期
-            ->latest()
-            ->first();
-    
-        if (!$vCode) {
-            return response()->json(['code' => 400, 'msg' => '验证码错误或已过期']);
+        // 2. 校验验证码 (本地环境支持 '123456')
+        $vCode = null;
+        if (app()->isLocal() && $request->verification_code === '123456') {
+            // 万能验证码，不消耗数据库记录
+        } else {
+            $vCode = VerificationCode::where('account', $account)
+                ->where('code', $request->verification_code)
+                ->where('type', 'register')
+                ->where('status', 0) // 未使用
+                ->where('expired_at', '>', now()) // 未过期
+                ->latest()
+                ->first();
+        
+            if (!$vCode) {
+                return response()->json(['code' => 400, 'msg' => '验证码错误或已过期']);
+            }
         }
     
         // 3. 检查用户是否已存在
@@ -209,7 +224,9 @@ class AuthController extends Controller
             ]);
     
             // 5. 标记验证码为已使用
-            $vCode->update(['status' => 1]);
+            if ($vCode) {
+                $vCode->update(['status' => 1]);
+            }
 
         } catch (\Exception $e) {
             Log::error('用户注册失败: ' . $e->getMessage());
@@ -265,20 +282,27 @@ class AuthController extends Controller
     
         // 3. 校验凭证
         if ($request->filled('verification_code')) {
-            // 验证码模式
-            $vCode = VerificationCode::where('account', $account)
-                ->where('code', $request->verification_code)
-                ->where('type', 'login')
-                ->where('status', 0) // 未使用
-                ->where('expired_at', '>', now()) // 未过期
-                ->latest()
-                ->first();
+            // 验证码模式 (本地环境支持 '123456')
+            $vCode = null;
+            if (app()->isLocal() && $request->verification_code === '123456') {
+                // 万能验证码
+            } else {
+                $vCode = VerificationCode::where('account', $account)
+                    ->where('code', $request->verification_code)
+                    ->where('type', 'login')
+                    ->where('status', 0) // 未使用
+                    ->where('expired_at', '>', now()) // 未过期
+                    ->latest()
+                    ->first();
 
-            if (!$vCode) {
-                return response()->json(['code' => 400, 'msg' => '验证码错误或已过期']);
+                if (!$vCode) {
+                    return response()->json(['code' => 400, 'msg' => '验证码错误或已过期']);
+                }
             }
             
-            $vCode->update(['status' => 1]);
+            if ($vCode) {
+                $vCode->update(['status' => 1]);
+            }
             
         } else {
             // 密码模式
@@ -321,22 +345,27 @@ class AuthController extends Controller
         $account = $request->account;
         $isEmail = filter_var($account, FILTER_VALIDATE_EMAIL);
 
-        // 2. 校验验证码
-        $vCodeQuery = VerificationCode::where('account', $account)
-            ->where('code', $request->verification_code)
-            ->where('type', 'reset') 
-            ->where('status', 0) // 未使用
-            ->where('expired_at', '>', now()); // 未过期
+        // 2. 校验验证码 (本地环境支持 '123456')
+        $vCode = null;
+        if (app()->isLocal() && $request->verification_code === '123456') {
+            // 万能验证码
+        } else {
+            $vCodeQuery = VerificationCode::where('account', $account)
+                ->where('code', $request->verification_code)
+                ->where('type', 'reset') 
+                ->where('status', 0) // 未使用
+                ->where('expired_at', '>', now()); // 未过期
 
-        // 如果是手机，必须带上区号查询
-        if (!$isEmail) {
-            $vCodeQuery->where('country_code', $request->country_code);
-        }
+            // 如果是手机，必须带上区号查询
+            if (!$isEmail) {
+                $vCodeQuery->where('country_code', $request->country_code);
+            }
 
-        $vCode = $vCodeQuery->latest()->first();
+            $vCode = $vCodeQuery->latest()->first();
 
-        if (!$vCode) {
-            return response()->json(['code' => 400, 'msg' => '验证码错误或已过期'], 400);
+            if (!$vCode) {
+                return response()->json(['code' => 400, 'msg' => '验证码错误或已过期'], 400);
+            }
         }
 
         // 3. 查找用户
@@ -355,7 +384,10 @@ class AuthController extends Controller
             DB::beginTransaction();
 
             $user->update(['password' => Hash::make($request->new_password)]);
-            $vCode->update(['status' => 1]); // 标记验证码已使用
+            
+            if ($vCode) {
+                $vCode->update(['status' => 1]); // 标记验证码已使用
+            }
 
             // 5. 让旧的 Token 全部失效，确保安全性 (非常好的实践)
             $user->tokens()->delete();

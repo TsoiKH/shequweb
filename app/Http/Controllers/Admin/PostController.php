@@ -10,7 +10,9 @@ class PostController extends Controller
 {
     public function index(Request $request)
     {
-        $query = Post::with(['user', 'reports']); 
+        $query = Post::with(['user', 'reports'])->withCount(['reports as pending_reports_count' => function ($query) {
+            $query->where('status', 0);
+        }]); 
     
         // 搜索：支持标题、内容、发布者昵称
         if ($request->filled('search')) {
@@ -34,7 +36,7 @@ class PostController extends Controller
             $query->where('status', $request->status);
         }
     
-        $posts = $query->orderBy('created_at', 'desc')->paginate(10)->withQueryString();
+        $posts = $query->orderBy('pending_reports_count', 'desc')->orderBy('created_at', 'desc')->paginate(10)->withQueryString();
     
         return view('admin.posts.index', compact('posts'));
     }

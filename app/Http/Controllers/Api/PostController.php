@@ -18,6 +18,7 @@ use App\Models\Collection;
 use App\Models\Notification;
 use App\Models\User;
 use App\Models\Tag;
+use App\Models\SensitiveWord;
 use Stevebauman\Location\Facades\Location;
 
 class PostController extends Controller
@@ -38,12 +39,28 @@ class PostController extends Controller
             'city'       => 'nullable|string',
         ]);
 
-        // --- 敏感词拦截 ---
-        $contentToScan = $request->title . $request->content;
-        $badWords = config('badwords.sensitive_words', []);
-        foreach ($badWords as $word) {
-            if (mb_strpos($contentToScan, $word) !== false) {
-                return response()->json(['code' => 422, 'msg' => "包含违规词: 【{$word}】"], 422);
+        // --- 敏感词处理系统 (数据库驱动) ---
+        $title = $request->title;
+        $content = $request->content;
+        
+        // 使用缓存 1 小时，提高性能
+        $sensitiveWords = Cache::remember('sensitive_words_list', 3600, function () {
+            return SensitiveWord::all(['word', 'type']);
+        });
+        
+        foreach ($sensitiveWords as $sw) {
+            $word = $sw->word;
+            
+            if ($sw->type === 'block') {
+                // A. 拦截模式：大小写不敏感匹配
+                if (mb_stripos($title, $word) !== false || mb_stripos($content, $word) !== false) {
+                    return response()->json(['code' => 422, 'msg' => "包含违规词: 【{$word}】"], 422);
+                }
+            } elseif ($sw->type === 'replace') {
+                // B. 替换模式：大小写不敏感替换
+                $replacement = str_repeat('*', mb_strlen($word));
+                $title = str_ireplace($word, $replacement, $title);
+                $content = str_ireplace($word, $replacement, $content);
             }
         }
 
@@ -65,8 +82,8 @@ class PostController extends Controller
         // 2. 创建帖子
         $post = Post::create([
             'user_id'    => $user->id,
-            'title'      => $request->title,
-            'content'    => $request->content,
+            'title'      => $title,
+            'content'    => $content,
             'media_urls' => $request->media_urls,
             'media_type' => $mediaType,
             'country'    => $position ? $position->countryName : 'Germany',
@@ -77,9 +94,10 @@ class PostController extends Controller
 
         // --- 3. 智能标签增强逻辑 ---
         $tagsToSync = $request->tags ?? [];
+        $contentToScan = $title . $content;
         
         // A. 自动从内容提取 #话题
-        preg_match_all('/#([^#\s\x{FF03}]+)/u', $request->content, $matches);
+        preg_match_all('/#([^#\s\x{FF03}]+)/u', $content, $matches);
         if (!empty($matches[1])) {
             $tagsToSync = array_merge($tagsToSync, $matches[1]);
         }
@@ -152,8 +170,7 @@ class PostController extends Controller
 
     public function index(Request $request)
     {
-        $me = auth('sanctum')->user();
-        $myId = $me ? $me->id : 0;
+        $myId = $this->getAuthUserId();
     
         // 获取前端传来的当前城市 (用于推荐排序)
         $currentCity = $request->get('city'); 
@@ -264,79 +281,14 @@ class PostController extends Controller
         ]);
     }
 
-    /**
-     * 发表评论
-     */
-    public function comment(Request $request, $id)
-    {
-        $request->validate([
-            'content'   => 'required|string|max:500',
-            'parent_id' => 'nullable|integer', 
-        ]);
-    
-        $post = Post::findOrFail($id);
-        $currentUser = $request->user();
-        $parentComment = null;
-    
-        // 1. 检查父评论是否存在
-        if ($request->filled('parent_id') && $request->parent_id > 0) {
-            $parentComment = Comment::where('id', $request->parent_id)
-                                    ->where('post_id', $id)
-                                    ->first();
-            if (!$parentComment) {
-                return response()->json(['code' => 400, 'msg' => '被回复的评论不存在']);
-            }
-        }
-    
-        // 2. 创建评论
-        $comment = Comment::create([
-            'user_id'   => $currentUser->id,
-            'post_id'   => $id,
-            'parent_id' => $request->parent_id ?? 0,
-            'content'   => $request->content,
-        ]);
-    
-        // 3. 增加帖子评论计数
-        $post->increment('comment_count');
-    
 
-        $targetUserId = 0;
-        
-        if ($parentComment) {
-            // 场景 A: 这是一条“回复”。通知原评论的作者。
-            $targetUserId = $parentComment->user_id;
-        } else {
-            // 场景 B: 这是一条“顶级评论”。通知帖子作者。
-            $targetUserId = $post->user_id;
-        }
-    
-        // 只有当接收者不是本人时，才插入通知记录
-        if ($targetUserId > 0 && $targetUserId != $currentUser->id) {
-            Notification::create([
-                'user_id'    => $targetUserId,
-                'sender_id'  => $currentUser->id,
-                'type'       => 'comment',
-                'post_id'    => $id,
-                'comment_id' => $comment->id,
-                'content'    => $request->content,
-                'is_read'    => 0,
-            ]);
-        }
-    
-        return response()->json([
-            'code' => 200,
-            'msg'  => '评论成功',
-            'data' => new CommentResource($comment->load('user'))
-        ]);
-    }
 
     /**
      * 获取帖子详情
      */
     public function show(Request $request, $id)
     {
-        $me = auth('sanctum')->user();
-        $myId = $me ? $me->id : 0;
+        $myId = $this->getAuthUserId();
     
         // 1. 获取基础数据，同时使用 withCount 预加载评论总数
         $post = Post::with(['user', 'tags'])
@@ -441,8 +393,7 @@ class PostController extends Controller
             return response()->json(['code' => 400, 'msg' => '请输入关键词']);
         }
 
-        $me = auth('sanctum')->user();
-        $myId = $me ? $me->id : 0;
+        $myId = $this->getAuthUserId();
 
         // 2. 构建基础查询
         $query = Post::with(['user', 'tags'])
@@ -584,32 +535,7 @@ class PostController extends Controller
         ]);
     }
 
-    public function deleteComment(Request $request, $comment_id)
-    {
-        $comment = Comment::findOrFail($comment_id);
-        $post = Post::findOrFail($comment->post_id);
-    
-        if ($comment->user_id !== $request->user()->id && $post->user_id !== $request->user()->id) {
-            return response()->json(['code' => 403, 'msg' => '无权删除'], 403);
-        }
-    
-        return DB::transaction(function () use ($comment, $post, $comment_id) {
-            $idsToDelete = Comment::where('id', $comment_id)
-                ->orWhere('parent_id', $comment_id)
-                ->pluck('id');
-            
-            $countToDelete = $idsToDelete->count();
-            Comment::whereIn('id', $idsToDelete)->delete();
-    
-            Notification::where('post_id', $post->id)
-                ->whereIn('comment_id', $idsToDelete)
-                ->delete();
-    
-            $post->decrement('comment_count', $countToDelete);
-    
-            return response()->json(['code' => 200, 'msg' => '删除成功']);
-        });
-    }
+
 
     public function userPosts(Request $request, $userId)
     {
@@ -656,48 +582,11 @@ class PostController extends Controller
         });
     }
 
-    public function toggleCommentLike(Request $request, $commentId)
-    {
-        $user = $request->user();
-        $comment = Comment::findOrFail($commentId);
-    
-        $likeQuery = $comment->likes()->where('user_id', $user->id);
-        $like = (clone $likeQuery)->first();
-    
-        if ($like) {
-            $likeQuery->delete();
-            $comment->decrement('like_count');
-            $status = 'unliked';
-        } else {
-            $comment->likes()->create(['user_id' => $user->id]);
-            $comment->increment('like_count');
-            $status = 'liked';
-    
-            if ($comment->user_id != $user->id) {
-                Notification::create([
-                    'user_id'    => $comment->user_id,
-                    'sender_id'  => $user->id,
-                    'type'       => 'like_comment',
-                    'post_id'    => $comment->post_id,
-                    'comment_id' => $comment->id,
-                ]);
-            }
-        }
-    
-        return response()->json([
-            'code' => 200,
-            'msg' => $status == 'liked' ? '点赞评论成功' : '已取消点赞',
-            'data' => [
-                'status' => $status,
-                'current_count' => $comment->like_count
-            ]
-        ]);
-    }
+
 
     public function getComments(Request $request, $id)
     {
-        $me = auth('sanctum')->user();
-        $myId = $me ? $me->id : 0;
+        $myId = $this->getAuthUserId();
     
         $comments = Comment::with([
                 'user', 
@@ -748,8 +637,7 @@ class PostController extends Controller
      */
     private function getPostList(Request $request, $filterCallback = null, $showPrivate = false)
     {
-        $me = auth('sanctum')->user();
-        $myId = $me ? $me->id : 0;
+        $myId = $this->getAuthUserId();
     
         // 1. 基础关联预加载
         $query = Post::with([
@@ -990,24 +878,18 @@ class PostController extends Controller
     /**
      * 获取某个主评论下的所有二级回复 (分页)
      */
-    public function commentReplies(Request $request, $id)
+    /**
+     * 获取某个主评论下的所有二级回复 (分页)
+     */
+
+
+    /**
+     * 获取当前登录用户ID
+     */
+    private function getAuthUserId()
     {
-        $parentComment = Comment::findOrFail($id);
-
-        // 分页获取子评论
-        $replies = Comment::with(['user'])
-            ->where('parent_id', $id)
-            ->orderBy('created_at', 'asc') // 二级回复通常按时间正序排列
-            ->paginate(20);
-
-        return response()->json([
-            'code' => 200,
-            'msg'  => '获取成功',
-            'data' => [
-                'parent_comment_id' => $id,
-                'replies' => CommentResource::collection($replies)->response()->getData(true)
-            ]
-        ]);
+        $me = auth('sanctum')->user();
+        return $me ? $me->id : 0;
     }
 
 }
